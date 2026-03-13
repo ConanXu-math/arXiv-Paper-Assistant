@@ -1,0 +1,54 @@
+# 环境与密钥
+.env
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+*.egg
+
+# 本地数据与索引（论文 PDF、数据库、向量库）
+arxiv_test/papers/
+arxiv_test/*.db
+arxiv_test/state.db
+arxiv_test/lancedb/
+
+# 日志与临时文件
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+.DS_Store
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/

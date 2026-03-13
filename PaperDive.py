@@ -23,9 +23,10 @@ load_dotenv()
 # 将 agno 的日志级别设为 ERROR，屏蔽 WARNING 及以下
 logging.getLogger("agno").setLevel(logging.ERROR)
 
-PAPERS_DIR     = Path("C:/Users/username/tmp/arxiv_agent/papers")
-SQLITE_DB_FILE = "C:/Users/username/tmp/arxiv_agent/state.db"
-LANCEDB_URI    = "C:/Users/username/tmp/arxiv_agent/lancedb"
+BASE_DIR = Path(__file__).parent
+PAPERS_DIR = BASE_DIR / "arxiv_test" / "papers"
+SQLITE_DB_FILE = str(BASE_DIR / "arxiv_test" / "state.db")
+LANCEDB_URI = str(BASE_DIR / "arxiv_test" / "lancedb")
 
 PAPERS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -53,9 +54,9 @@ pdf_reader = PDFReader(
 )
 
 shared_llm = OpenAILike(
-    id="coding-glm-4.7-free",
-    api_key=os.getenv("OPENAI_API_KEY"),
-    base_url="https://aihubmix.com/v1",
+    id=os.getenv("LLM_MODEL_ID", "ecnu-plus"),
+    api_key=os.getenv("LLM_API_KEY"),
+    base_url=os.getenv("LLM_BASE_URL", "https://chat.ecnu.edu.cn/open/api/v1"),
     timeout=300.0,
 )
 
@@ -201,7 +202,7 @@ def list_indexed_papers() -> str:
 
 
 @tool
-def load_paper_for_deep_analysis(arxiv_url_or_id: str) -> str:
+def load_paper_for_deep_analysis(arxiv_url_or_id: str | float | int) -> str:
     """
     自动下载指定 arXiv 论文的 PDF，永久索引到向量知识库，支持后续深度精准问答。
 
@@ -222,7 +223,7 @@ def load_paper_for_deep_analysis(arxiv_url_or_id: str) -> str:
         索引成功确认，或失败原因说明。
     """
     # ── 归一化 ID ────────────────────────────────────────────
-    raw = arxiv_url_or_id.strip()
+    raw = str(arxiv_url_or_id).strip()
     if raw.startswith("http"):
         arxiv_id = raw.split("/abs/")[-1].split("/pdf/")[-1].removesuffix(".pdf")
         abs_url  = f"https://arxiv.org/abs/{arxiv_id}"
