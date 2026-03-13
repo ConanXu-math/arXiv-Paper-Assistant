@@ -88,17 +88,6 @@ python PaperDive.py
   - 先指定聚焦论文（如 `研究 2301.12345`），后续问题默认针对该论文。
 - **退出**：输入 `exit`、`quit` 或 `bye`。
 
-示例交互：
-```
-You: 找一下 reinforcement learning
-[arXiv Researcher 返回检索结果]
-
-You: 加载第一篇
-[Local RAG Expert 下载并索引论文]
-
-You: 这篇论文的主要贡献是什么？
-[基于刚加载的论文给出带引用的回答]
-```
 
 ## 技术栈
 
