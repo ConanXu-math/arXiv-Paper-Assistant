@@ -30,8 +30,14 @@ LANCEDB_URI = str(BASE_DIR / "arxiv_test" / "lancedb")
 
 PAPERS_DIR.mkdir(parents=True, exist_ok=True)
 
-agent_db     = SqliteDb(db_file=SQLITE_DB_FILE, session_table="agent_sessions", memory_table="agent_memory")
-knowledge_db = SqliteDb(db_file=SQLITE_DB_FILE, knowledge_table="knowledge_contents", session_table="knowledge_sessions")
+agent_db = SqliteDb(
+    db_file=SQLITE_DB_FILE, session_table="agent_sessions", memory_table="agent_memory"
+)
+knowledge_db = SqliteDb(
+    db_file=SQLITE_DB_FILE,
+    knowledge_table="knowledge_contents",
+    session_table="knowledge_sessions",
+)
 
 
 vector_db = LanceDb(
@@ -39,14 +45,15 @@ vector_db = LanceDb(
     table_name="arxiv_paper_chunks",
     search_type=SearchType.vector,
     embedder=OllamaEmbedder(
-        id="bge-m3",   
+        id="bge-m3",
         dimensions=1024,
+        timeout=120.0,
     ),
 )
 
 
-#把文章按语义自然分割成多个块，每个块的字符数尽量接近 800
-semantic_chunking = SemanticChunking(chunk_size=800, similarity_threshold=0.6)
+# 把文章按语义自然分割成多个块，每个块的字符数尽量接近 1200
+semantic_chunking = SemanticChunking(chunk_size=1200, similarity_threshold=0.6)
 
 pdf_reader = PDFReader(
     chunking_strategy=semantic_chunking,
@@ -63,7 +70,7 @@ shared_llm = OpenAILike(
 shared_knowledge = Knowledge(
     name="arxiv_library",
     vector_db=vector_db,
-    contents_db=knowledge_db,   
+    contents_db=knowledge_db,
     readers={"pdf": pdf_reader},
     max_results=8,
 )
@@ -74,9 +81,7 @@ def _get_indexed_names() -> set:
     try:
         contents, _ = shared_knowledge.get_content()
         return {
-            c.name
-            for c in contents
-            if c.status == ContentStatus.COMPLETED and c.name
+            c.name for c in contents if c.status == ContentStatus.COMPLETED and c.name
         }
     except Exception as e:
         print(f"[Debug] _get_indexed_names 出错: {e}")
@@ -87,7 +92,8 @@ def _get_indexed_names() -> set:
 # 工具定义
 # ─────────────────────────────────────────────────────────────
 
-def _perform_scan() ->str:
+
+def _perform_scan() -> str:
     """
     扫描本地论文文件夹，将尚未索引的新 PDF 写入向量知识库。
     已索引过的论文自动跳过，不重复处理，不删除历史数据。
@@ -141,7 +147,7 @@ def _perform_scan() ->str:
                 name=paper_id,
                 path=str(pdf_path),
                 reader=pdf_reader,
-                #upsert=False,
+                # upsert=False,
                 skip_if_exists=True,
             )
             success.append(paper_id)
@@ -164,9 +170,11 @@ def _perform_scan() ->str:
     lines.append("\n现在可以就任意论文提问了！")
     return "\n".join(lines)
 
+
 @tool
 def scan_and_index_new_papers() -> str:
     return _perform_scan()
+
 
 @tool
 def list_indexed_papers() -> str:
@@ -190,7 +198,9 @@ def list_indexed_papers() -> str:
     lines = [f"知识库共有 {len(indexed_names)} 篇论文：\n"]
     for i, name in enumerate(sorted(indexed_names), 1):
         pdf_path = PAPERS_DIR / f"{name}.pdf"
-        status = "本地缓存存在" if pdf_path.exists() else " 源文件已移除（向量仍可检索）"
+        status = (
+            "本地缓存存在" if pdf_path.exists() else " 源文件已移除（向量仍可检索）"
+        )
         lines.append(f"  [{i}] {name}　{status}")
 
     lines += [
@@ -201,8 +211,41 @@ def list_indexed_papers() -> str:
     return "\n".join(lines)
 
 
+def _fetch_arxiv_title(arxiv_id: str) -> str | None:
+    """获取 arXiv 论文的标题，失败时返回 None。"""
+    abs_url = f"https://arxiv.org/abs/{arxiv_id}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+    try:
+        with httpx.Client(timeout=30, follow_redirects=True) as client:
+            resp = client.get(abs_url, headers=headers)
+            if resp.status_code != 200:
+                return None
+            # 解析 HTML 中的标题（简单正则）
+            import re
+
+            match = re.search(
+                r"<title>arXiv:[\w.]+\s+(.*?)</title>", resp.text, re.DOTALL
+            )
+            if match:
+                title = match.group(1).strip()
+                # 移除可能的多余空白和换行
+                title = re.sub(r"\s+", " ", title)
+                return title
+    except Exception:
+        pass
+    return None
+
+
 @tool
-def load_paper_for_deep_analysis(arxiv_url_or_id: str | float | int) -> str:
+def load_paper_for_deep_analysis(
+    arxiv_url_or_id: str | float | int, expected_title: str | None = None
+) -> str:
     """
     自动下载指定 arXiv 论文的 PDF，永久索引到向量知识库，支持后续深度精准问答。
 
@@ -215,9 +258,11 @@ def load_paper_for_deep_analysis(arxiv_url_or_id: str | float | int) -> str:
     2. 若知识库已有该论文 → 直接告知，跳过索引
     3. 若本地缓存已有 PDF → 跳过下载，直接索引
     4. 否则：伪装浏览器 UA 下载 → 持久化保存 → 语义分块 → 向量化 → 写入 LanceDB
+    5. 额外步骤：获取 arXiv 标题并验证，避免 LLM 幻觉导致的 ID‑标题不匹配
 
     Args:
         arxiv_url_or_id: arXiv 完整 URL 或 arXiv ID（如 2301.12345 或 2301.12345v2）
+        expected_title: 可选的预期标题，若提供则进行简单关键词匹配校验
 
     Returns:
         索引成功确认，或失败原因说明。
@@ -226,17 +271,17 @@ def load_paper_for_deep_analysis(arxiv_url_or_id: str | float | int) -> str:
     raw = str(arxiv_url_or_id).strip()
     if raw.startswith("http"):
         arxiv_id = raw.split("/abs/")[-1].split("/pdf/")[-1].removesuffix(".pdf")
-        abs_url  = f"https://arxiv.org/abs/{arxiv_id}"
+        abs_url = f"https://arxiv.org/abs/{arxiv_id}"
     else:
         arxiv_id = raw.removesuffix(".pdf").strip()
-        abs_url  = f"https://arxiv.org/abs/{arxiv_id}"
+        abs_url = f"https://arxiv.org/abs/{arxiv_id}"
 
     # [Fix-4] 路径穿越防御：仅允许字母、数字、点号、横线
     # 拒绝 "../etc/passwd" 或包含斜杠、空格的恶意输入
-    if not re.match(r'^[\w.\-]+$', arxiv_id):
+    if not re.match(r"^[\w.\-]+$", arxiv_id):
         return f"非法的 arXiv ID 格式：「{arxiv_id}」\n合法示例：2301.12345 或 2301.12345v2"
 
-    pdf_url        = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
     local_pdf_path = PAPERS_DIR / f"{arxiv_id}.pdf"
 
     try:
@@ -272,6 +317,26 @@ def load_paper_for_deep_analysis(arxiv_url_or_id: str | float | int) -> str:
         else:
             print(f"[缓存] 命中本地文件 {local_pdf_path}，跳过下载")
 
+        # ── 获取 arXiv 标题并校验（避免 LLM 幻觉）─────────────
+        title = _fetch_arxiv_title(arxiv_id)
+        if title:
+            print(f"[校验] 论文标题：{title}")
+            # 简单关键词匹配（若用户提供了预期标题）
+            if expected_title:
+                import difflib
+
+                ratio = difflib.SequenceMatcher(
+                    None, expected_title.lower(), title.lower()
+                ).ratio()
+                if ratio < 0.6:  # 相似度阈值
+                    print(
+                        f"[警告] 下载的论文标题与预期差异较大，请确认是否为同一篇论文。"
+                    )
+                    print(f"      预期：{expected_title}")
+                    print(f"      实际：{title}")
+        else:
+            print(f"[警告] 无法获取论文标题，请确认 arXiv ID {arxiv_id} 有效。")
+
         print(f"[索引] 正在向量化 {arxiv_id}，请稍候（大论文可能需要几分钟）...")
         shared_knowledge.insert(
             name=arxiv_id,
@@ -280,8 +345,9 @@ def load_paper_for_deep_analysis(arxiv_url_or_id: str | float | int) -> str:
             skip_if_exists=True,
         )
 
+        title_line = f"\n论文标题：{title}" if title else ""
         return (
-            f"论文 **{arxiv_id}** 已成功下载并索引至知识库！\n\n"
+            f"论文 **{arxiv_id}** 已成功下载并索引至知识库！{title_line}\n\n"
             f"原文链接：{abs_url}\n"
             f"本地缓存：{local_pdf_path}\n\n"
             f"现在可以就该论文的任何内容提问，"
@@ -333,21 +399,38 @@ def search_arxiv_papers(query: str, max_results: int = 3) -> str:
 
         lines = [f"arXiv 检索结果：「{query}」\n"]
         for i, entry in enumerate(entries, 1):
-            title    = entry.find("atom:title",   ns).text.strip().replace("\n", " ")
-            summary  = entry.find("atom:summary", ns).text.strip().replace("\n", " ")
-            abs_url  = entry.find("atom:id",      ns).text.strip()
-            arxiv_id = abs_url.split("/abs/")[-1]
-            authors  = [
-                a.find("atom:name", ns).text
-                for a in entry.findall("atom:author", ns)
-            ]
+            title_elem = entry.find("atom:title", ns)
+            title = (
+                title_elem.text.strip().replace("\n", " ")
+                if title_elem is not None and title_elem.text
+                else "无标题"
+            )
+            summary_elem = entry.find("atom:summary", ns)
+            summary = (
+                summary_elem.text.strip().replace("\n", " ")
+                if summary_elem is not None and summary_elem.text
+                else "无摘要"
+            )
+            abs_elem = entry.find("atom:id", ns)
+            abs_url = (
+                abs_elem.text.strip() if abs_elem is not None and abs_elem.text else ""
+            )
+            arxiv_id = abs_url.split("/abs/")[-1] if abs_url else "未知ID"
+            author_elems = entry.findall("atom:author", ns)
+            authors = []
+            for a in author_elems:
+                name_elem = a.find("atom:name", ns)
+                if name_elem is not None and name_elem.text:
+                    authors.append(name_elem.text)
+            author_str = ", ".join(authors[:3]) if authors else "未知作者"
+            if len(authors) > 3:
+                author_str += "等"
             lines.append(
                 f"**[{i}] {title}**\n"
                 f"  - arXiv ID：`{arxiv_id}`\n"
-                f"  - 作者：{', '.join(authors[:3])}"
-                f"{'等' if len(authors) > 3 else ''}\n"
+                f"  - 作者：{author_str}\n"
                 f"  - 摘要：{summary[:280]}…\n"
-                f"  - 链接：{abs_url}\n"
+                f"  - 链接：{abs_url if abs_url else '无链接'}\n"
             )
 
         lines += [
@@ -379,7 +462,11 @@ rag_expert = Agent(
     name="Local RAG Expert",
     role="负责本地 PDF 管理与基于知识库的深度精读问答",
     model=shared_llm,
-    tools=[scan_and_index_new_papers, list_indexed_papers, load_paper_for_deep_analysis],
+    tools=[
+        scan_and_index_new_papers,
+        list_indexed_papers,
+        load_paper_for_deep_analysis,
+    ],
     knowledge=shared_knowledge,
     search_knowledge=True,
     add_knowledge_to_context=True,
@@ -408,15 +495,12 @@ arxiv_team = Team(
     name="arXiv Team",
     model=shared_llm,
     members=[arxiv_researcher, rag_expert],
-    
     # 主管掌控记忆和对话历史
     db=agent_db,
     num_history_runs=10,
     add_history_to_context=True,
     enable_agentic_memory=True,
-    
-    tools=[list_indexed_papers], 
-    
+    tools=[list_indexed_papers],
     instructions=dedent("""
         你是 arXiv 学术助理团队的主管。你的任务是将用户需求委派（Delegate）给最合适的专家。
         
@@ -442,11 +526,9 @@ arxiv_team = Team(
 )
 
 
-
 def interactive_cli():
     """同步命令行交互入口。"""
     PAPERS_DIR.mkdir(parents=True, exist_ok=True)
-
 
     print("正在扫描论文文件夹...\n")
     scan_result = _perform_scan()
@@ -466,7 +548,7 @@ def interactive_cli():
         if raw.lower() in ("exit", "quit", "bye", "退出"):
             print("感谢使用，再见！")
             break
-       
+
         arxiv_team.print_response(raw, stream=True)
         print()
 
