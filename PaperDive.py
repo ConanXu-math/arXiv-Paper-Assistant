@@ -20,11 +20,16 @@ from agno.tools import tool
 from agno.vectordb.lancedb import LanceDb, SearchType
 
 load_dotenv()
+# 抑制 numpy 除以零警告
+import warnings
+
+warnings.filterwarnings("ignore", message="invalid value encountered in scalar divide")
 # 将 agno 的日志级别设为 ERROR，屏蔽 WARNING 及以下
 logging.getLogger("agno").setLevel(logging.ERROR)
 
 BASE_DIR = Path(__file__).parent
 PAPERS_DIR = BASE_DIR / "arxiv_test" / "papers"
+NOTES_DIR = BASE_DIR / "notes"
 SQLITE_DB_FILE = str(BASE_DIR / "arxiv_test" / "state.db")
 LANCEDB_URI = str(BASE_DIR / "arxiv_test" / "lancedb")
 
@@ -33,6 +38,8 @@ PAPERS_DIR.mkdir(parents=True, exist_ok=True)
 agent_db = SqliteDb(
     db_file=SQLITE_DB_FILE, session_table="agent_sessions", memory_table="agent_memory"
 )
+
+
 knowledge_db = SqliteDb(
     db_file=SQLITE_DB_FILE,
     knowledge_table="knowledge_contents",
@@ -140,8 +147,11 @@ def _perform_scan() -> str:
 
     # 情况四：有新论文，执行追加索引（不清除旧数据）
     success, failed = [], []
-    for pdf_path in new_files:
+    total = len(new_files)
+    print(f"发现 {total} 篇新论文，开始索引（大论文可能需数分钟）...\n", flush=True)
+    for i, pdf_path in enumerate(new_files, 1):
         paper_id = pdf_path.stem
+        print(f"[{i}/{total}] 正在索引: {paper_id} ...", flush=True)
         try:
             shared_knowledge.insert(
                 name=paper_id,
@@ -151,8 +161,10 @@ def _perform_scan() -> str:
                 skip_if_exists=True,
             )
             success.append(paper_id)
+            print(f"[{i}/{total}] 完成: {paper_id}", flush=True)
         except Exception as e:
             failed.append(f"{pdf_path.name}：{e}")
+            print(f"[{i}/{total}] 失败: {paper_id} — {e}", flush=True)
 
     lines = [f" 已成功索引 {len(success)} 篇新论文：\n"]
     for i, pid in enumerate(success, 1):
@@ -444,6 +456,63 @@ def search_arxiv_papers(query: str, max_results: int = 3) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
+# 工具定义：笔记保存
+# ─────────────────────────────────────────────────────────────
+
+
+@tool
+def save_note(filename: str, content: str) -> str:
+    """
+    将笔记内容保存到本地文件（Markdown 格式）。
+
+    【调用时机】：
+    - 用户要求保存总结、笔记或任何文本内容时。
+
+    Args:
+        filename: 文件名（不含扩展名），将自动添加 .md 后缀。
+        content: 要保存的文本内容。
+
+    Returns:
+        成功或失败消息。
+    """
+    import os
+    from pathlib import Path
+
+    if not filename.endswith(".md"):
+        filename += ".md"
+    path = NOTES_DIR / filename
+    try:
+        path.write_text(content, encoding="utf-8")
+        return f"笔记已保存至：{path}"
+    except Exception as e:
+        return f"保存失败：{e}"
+
+
+@tool
+def list_notes() -> str:
+    """
+    列出所有已保存的笔记文件。
+
+    【调用时机】：
+    - 用户询问“有哪些笔记”或“查看已保存的笔记”时。
+
+    Returns:
+        笔记文件列表，包含文件名和大小。
+    """
+    import os
+    from pathlib import Path
+
+    files = list(NOTES_DIR.glob("*.md"))
+    if not files:
+        return "暂无笔记文件。"
+    lines = [f"共有 {len(files)} 个笔记文件："]
+    for i, f in enumerate(sorted(files), 1):
+        size = f.stat().st_size
+        lines.append(f"  [{i}] {f.name} ({size} 字节)")
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────
 # Agent 构建
 # ─────────────────────────────────────────────────────────────
 
@@ -466,6 +535,8 @@ rag_expert = Agent(
         scan_and_index_new_papers,
         list_indexed_papers,
         load_paper_for_deep_analysis,
+        save_note,
+        list_notes,
     ],
     knowledge=shared_knowledge,
     search_knowledge=True,
@@ -475,7 +546,7 @@ rag_expert = Agent(
         绝对红线：回答论文内容必须且只能基于知识库检索结果！
         
         【工具调用严格规范 - 必读】：
-        你的可用工具包括 `search_knowledge_base` (用于检索论文内容) 和 `list_indexed_papers` (用于查看论文列表)。
+         你的可用工具包括 `search_knowledge_base` (用于检索论文内容)、`list_indexed_papers` (用于查看论文列表)、`save_note` (用于保存笔记) 和 `list_notes` (用于列出笔记文件)。
         严禁将工具名称拼接或修改！必须准确使用上述工具名。
         
         【高级检索技巧 - 必读】：
@@ -484,8 +555,11 @@ rag_expert = Agent(
         "Abstract, Introduction, main contribution, conclusion" 
         这样才能命中论文的核心段落，从而给出总结。
 
-        如果检索不到，明确回答"知识库中未找到相关内容"，绝不允许自己编造！
-        每次陈述必须带上引用标识（如 [第3页]）。
+         如果检索不到，明确回答"知识库中未找到相关内容"，绝不允许自己编造！
+         每次陈述必须带上引用标识（如 [第3页]）。
+         
+         【笔记保存】：
+         当用户要求保存总结或笔记时，使用 `save_note` 工具，提供文件名（不含扩展名）和内容。使用 `list_notes` 查看已有笔记。
     """),
     markdown=True,
 )
@@ -500,7 +574,7 @@ arxiv_team = Team(
     num_history_runs=10,
     add_history_to_context=True,
     enable_agentic_memory=True,
-    tools=[list_indexed_papers],
+    tools=[list_indexed_papers, save_note, list_notes],
     instructions=dedent("""
         你是 arXiv 学术助理团队的主管。你的任务是将用户需求委派（Delegate）给最合适的专家。
         
