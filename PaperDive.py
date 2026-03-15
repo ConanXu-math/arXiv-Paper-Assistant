@@ -14,7 +14,14 @@ from agno.knowledge.chunking.semantic import SemanticChunking
 from agno.knowledge.content import ContentStatus
 from agno.knowledge.embedder.ollama import OllamaEmbedder
 from agno.knowledge.knowledge import Knowledge
-from agno.knowledge.reader.pdf_reader import PDFReader
+from agno.knowledge.reader.pdf_reader import PDFReader  # kept as fallback
+from ocr_pdf_reader import OcrPDFReader
+from structure_extractor import (
+    extract_paper_structure,
+    find_section_for_page,
+    find_elements_on_page,
+    format_structure_for_display,
+)
 from agno.models.openai.like import OpenAILike
 from agno.tools import tool
 from agno.vectordb.lancedb import LanceDb, SearchType
@@ -62,7 +69,10 @@ vector_db = LanceDb(
 # 把文章按语义自然分割成多个块，每个块的字符数尽量接近 1200
 semantic_chunking = SemanticChunking(chunk_size=1200, similarity_threshold=0.6)
 
-pdf_reader = PDFReader(
+pdf_reader = OcrPDFReader(
+    ocr_url="https://edusys5.sii.edu.cn/ocr",
+    dpi=200,
+    max_workers=4,
     chunking_strategy=semantic_chunking,
     split_on_pages=True,
 )
@@ -95,6 +105,98 @@ def _get_indexed_names() -> set:
         return set()
 
 
+def _cleanup_stuck_processing():
+    """清理卡在 processing 状态的记录，避免重启后无法重新索引。"""
+    try:
+        conn = sqlite3.connect(SQLITE_DB_FILE)
+        cursor = conn.execute(
+            "DELETE FROM knowledge_contents WHERE status = 'processing'"
+        )
+        n = cursor.rowcount
+        conn.commit()
+        conn.close()
+        if n > 0:
+            print(f"[清理] 已移除 {n} 条卡住的索引记录，将重新索引。", flush=True)
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────
+# 论文结构存储（SQLite）
+# ─────────────────────────────────────────────────────────────
+
+import json
+import sqlite3
+
+def _init_structure_table():
+    conn = sqlite3.connect(SQLITE_DB_FILE)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS paper_structures ("
+        "  paper_id TEXT PRIMARY KEY,"
+        "  structure_json TEXT,"
+        "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        ")"
+    )
+    conn.commit()
+    conn.close()
+
+_init_structure_table()
+
+
+def save_paper_structure(paper_id: str, structure: dict) -> None:
+    conn = sqlite3.connect(SQLITE_DB_FILE)
+    conn.execute(
+        "INSERT OR REPLACE INTO paper_structures (paper_id, structure_json) VALUES (?, ?)",
+        (paper_id, json.dumps(structure, ensure_ascii=False)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_paper_structure(paper_id: str) -> dict | None:
+    conn = sqlite3.connect(SQLITE_DB_FILE)
+    row = conn.execute(
+        "SELECT structure_json FROM paper_structures WHERE paper_id = ?",
+        (paper_id,),
+    ).fetchone()
+    conn.close()
+    if row:
+        return json.loads(row[0])
+    return None
+
+
+def _build_page_metadata(structure: dict, total_pages: int) -> dict[int, dict]:
+    """Build per-page metadata dict from a structure for OcrPDFReader."""
+    metadata: dict[int, dict] = {}
+    for i in range(total_pages):
+        page_num = i + 1
+        section = find_section_for_page(structure, page_num)
+        elements = find_elements_on_page(structure, page_num)
+        meta: dict[str, str] = {}
+        if section:
+            meta["section"] = section
+        if elements:
+            meta["element_types"] = ",".join(elements)
+        if meta:
+            metadata[i] = meta
+    return metadata
+
+
+def _extract_and_store_structure(paper_id: str, pages: list[str]) -> dict:
+    """Run two-phase structure extraction, store result, return structure."""
+    print(f"[结构] 正在提取 {paper_id} 的论文结构...", flush=True)
+    structure = extract_paper_structure(pages, llm=shared_llm)
+    save_paper_structure(paper_id, structure)
+    n_thm = len(structure.get("theorems", []))
+    n_def = len(structure.get("definitions", []))
+    n_sec = len(structure.get("sections", []))
+    print(
+        f"[结构] 完成: {n_sec} 个章节, {n_thm} 个定理/引理, {n_def} 个定义",
+        flush=True,
+    )
+    return structure
+
+
 # ─────────────────────────────────────────────────────────────
 # 工具定义
 # ─────────────────────────────────────────────────────────────
@@ -110,6 +212,7 @@ def _perform_scan() -> str:
         无新论文：现有论文列表 + 引导选项。
         文件夹为空：下载操作指引。
     """
+    _cleanup_stuck_processing()
     pdf_files = sorted(PAPERS_DIR.glob("*.pdf"))
 
     # 情况一：文件夹为空
@@ -161,7 +264,13 @@ def _perform_scan() -> str:
                 skip_if_exists=True,
             )
             success.append(paper_id)
-            print(f"[{i}/{total}] 完成: {paper_id}", flush=True)
+            print(f"[{i}/{total}] 索引完成: {paper_id}", flush=True)
+            # 结构提取是可选增强，失败不影响索引
+            if pdf_reader.last_ocr_pages:
+                try:
+                    _extract_and_store_structure(paper_id, pdf_reader.last_ocr_pages)
+                except Exception as se:
+                    print(f"[{i}/{total}] 结构提取失败（不影响检索）: {se}", flush=True)
         except Exception as e:
             failed.append(f"{pdf_path.name}：{e}")
             print(f"[{i}/{total}] 失败: {paper_id} — {e}", flush=True)
@@ -297,6 +406,7 @@ def load_paper_for_deep_analysis(
     local_pdf_path = PAPERS_DIR / f"{arxiv_id}.pdf"
 
     try:
+        _cleanup_stuck_processing()
         # ── 已在知识库中？直接告知 ───────────────────────────
         if arxiv_id in _get_indexed_names():
             return (
@@ -357,13 +467,26 @@ def load_paper_for_deep_analysis(
             skip_if_exists=True,
         )
 
+        structure_info = ""
+        if pdf_reader.last_ocr_pages:
+            try:
+                structure = _extract_and_store_structure(arxiv_id, pdf_reader.last_ocr_pages)
+                n_thm = len(structure.get("theorems", []))
+                n_def = len(structure.get("definitions", []))
+                n_sec = len(structure.get("sections", []))
+                structure_info = f"\n结构提取：{n_sec} 个章节, {n_thm} 个定理/引理, {n_def} 个定义"
+            except Exception as se:
+                print(f"[结构] 提取失败（不影响检索）: {se}", flush=True)
+
         title_line = f"\n论文标题：{title}" if title else ""
         return (
-            f"论文 **{arxiv_id}** 已成功下载并索引至知识库！{title_line}\n\n"
+            f"论文 **{arxiv_id}** 已成功下载并索引至知识库！{title_line}"
+            f"{structure_info}\n\n"
             f"原文链接：{abs_url}\n"
             f"本地缓存：{local_pdf_path}\n\n"
             f"现在可以就该论文的任何内容提问，"
             f"我将严格基于论文原文给出带引用的精准回答。\n"
+            f"可使用 `get_paper_structure` 查看论文结构大纲。\n"
             f"（若论文中未涉及您的问题，我会明确告知。）"
         )
 
@@ -513,6 +636,96 @@ def list_notes() -> str:
 
 
 # ─────────────────────────────────────────────────────────────
+# 工具定义：结构化检索
+# ─────────────────────────────────────────────────────────────
+
+
+@tool
+def get_paper_structure(paper_id: str) -> str:
+    """
+    获取论文的结构化大纲：章节层级、定理/引理列表、定义、证明、关键公式。
+
+    【调用时机】：
+    - 用户说"论文结构是什么"、"有哪些定理"、"列出定义"时
+    - 在深入提问某篇论文的具体定理/证明前，先调用此工具了解全貌
+
+    Args:
+        paper_id: 论文在知识库中的名称（通常是 arXiv ID，如 2301.12345）
+
+    Returns:
+        格式化的论文结构大纲（Markdown），包含章节、定理、定义、证明列表。
+        若未找到结构数据，返回提示信息。
+    """
+    structure = load_paper_structure(paper_id)
+    if structure is None:
+        return (
+            f"未找到论文 {paper_id} 的结构数据。\n"
+            f"可能原因：该论文在结构提取功能上线前已索引。\n"
+            f"建议：删除后重新加载该论文以触发结构提取。"
+        )
+    return format_structure_for_display(structure)
+
+
+@tool
+def search_structured(
+    query: str,
+    paper_id: str = "",
+    element_type: str = "",
+) -> str:
+    """
+    在知识库中按结构类型精准检索论文内容。
+
+    【调用时机】：
+    - 用户问"定理3.1是什么"→ element_type="theorem"
+    - 用户问"定理3.1怎么证明的"→ element_type="proof"
+    - 用户问"XX的定义"→ element_type="definition"
+    - 需要精确定位特定类型内容时
+
+    Args:
+        query: 检索关键词（如 "theorem 3.1 statement", "proof of main theorem"）
+        paper_id: 可选，限定在某篇论文内检索（论文名称/arXiv ID）
+        element_type: 可选，按结构类型过滤。
+                     可选值: theorem, proof, definition, equation
+
+    Returns:
+        匹配的文本块列表，带页码和结构类型标注。
+    """
+    filters: dict[str, any] = {}
+    if paper_id:
+        filters["name"] = paper_id
+    if element_type:
+        filters["element_types"] = element_type
+
+    results = vector_db.search(query, limit=8, filters=filters if filters else None)
+
+    if not results:
+        filter_desc = ""
+        if paper_id:
+            filter_desc += f" 论文={paper_id}"
+        if element_type:
+            filter_desc += f" 类型={element_type}"
+        return f"未找到匹配结果。查询: '{query}'{filter_desc}\n建议：尝试放宽过滤条件或换用不同关键词。"
+
+    lines = [f"找到 {len(results)} 条结果：\n"]
+    for i, doc in enumerate(results, 1):
+        meta = doc.meta_data or {}
+        page = meta.get("page", "?")
+        section = meta.get("section", "")
+        etypes = meta.get("element_types", "")
+        header_parts = [f"p.{page}"]
+        if section:
+            header_parts.append(section)
+        if etypes:
+            header_parts.append(f"[{etypes}]")
+        header = " | ".join(header_parts)
+
+        content_preview = (doc.content or "")[:400]
+        lines.append(f"**[{i}]** ({header})\n{content_preview}\n")
+
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────
 # Agent 构建
 # ─────────────────────────────────────────────────────────────
 
@@ -535,6 +748,8 @@ rag_expert = Agent(
         scan_and_index_new_papers,
         list_indexed_papers,
         load_paper_for_deep_analysis,
+        get_paper_structure,
+        search_structured,
         save_note,
         list_notes,
     ],
@@ -546,20 +761,36 @@ rag_expert = Agent(
         绝对红线：回答论文内容必须且只能基于知识库检索结果！
         
         【工具调用严格规范 - 必读】：
-         你的可用工具包括 `search_knowledge_base` (用于检索论文内容)、`list_indexed_papers` (用于查看论文列表)、`save_note` (用于保存笔记) 和 `list_notes` (用于列出笔记文件)。
+        你的可用工具包括：
+        - `search_knowledge_base`：语义检索论文内容（通用）
+        - `get_paper_structure`：获取论文结构大纲（章节、定理、证明、定义列表）
+        - `search_structured`：按结构类型精准检索（支持 element_type 过滤）
+        - `list_indexed_papers`：查看论文列表
+        - `save_note` / `list_notes`：笔记管理
         严禁将工具名称拼接或修改！必须准确使用上述工具名。
-        
-        【高级检索技巧 - 必读】：
-        当用户或主管要求你“研究”、“总结”某篇论文（而不是问某个具体细节）时，不要拿指令去搜索！
-        你应该将检索关键词（Query）设置为该论文核心章节的英文词汇，例如调用搜索时输入：
-        "Abstract, Introduction, main contribution, conclusion" 
-        这样才能命中论文的核心段落，从而给出总结。
 
-         如果检索不到，明确回答"知识库中未找到相关内容"，绝不允许自己编造！
-         每次陈述必须带上引用标识（如 [第3页]）。
-         
-         【笔记保存】：
-         当用户要求保存总结或笔记时，使用 `save_note` 工具，提供文件名（不含扩展名）和内容。使用 `list_notes` 查看已有笔记。
+        【数学论文精读策略 - 必读】：
+        1. 收到关于某篇论文的问题时，先调用 `get_paper_structure` 获取论文结构大纲。
+        2. 若用户问定理/证明/定义相关问题，用 `search_structured` 按 element_type 精准检索。
+           例如：问"定理3.1是什么" → search_structured(query="Theorem 3.1", element_type="theorem")
+                 问"定理3.1怎么证明的" → search_structured(query="proof of Theorem 3.1", element_type="proof")
+                 问"XX的定义" → search_structured(query="definition of XX", element_type="definition")
+        3. 若用户问"定理X怎么证明的"，先搜 element_type="proof" 找到证明，
+           再搜 element_type="theorem" 找到定理陈述，一起呈现。
+        4. 回答时引用格式：[Theorem 3.1, p.5] 或 [Definition 2.1, p.3]。
+        5. 若涉及公式推导，按证明步骤逐步展示，保留 LaTeX 格式（用 $ 或 $$ 包裹）。
+
+        【高级检索技巧 - 必读】：
+        当用户或主管要求你"研究"、"总结"某篇论文时：
+        1. 先调用 `get_paper_structure` 了解全貌
+        2. 再用 `search_knowledge_base` 检索 "Abstract, Introduction, main contribution, conclusion"
+        3. 结合结构大纲和检索结果，给出带结构化引用的总结
+
+        如果检索不到，明确回答"知识库中未找到相关内容"，绝不允许自己编造！
+        每次陈述必须带上引用标识（如 [Theorem 3.1, p.5] 或 [第3页]）。
+
+        【笔记保存】：
+        当用户要求保存总结或笔记时，使用 `save_note` 工具，提供文件名（不含扩展名）和内容。使用 `list_notes` 查看已有笔记。
     """),
     markdown=True,
 )
@@ -574,7 +805,7 @@ arxiv_team = Team(
     num_history_runs=10,
     add_history_to_context=True,
     enable_agentic_memory=True,
-    tools=[list_indexed_papers, save_note, list_notes],
+    tools=[list_indexed_papers, get_paper_structure, save_note, list_notes],
     instructions=dedent("""
         你是 arXiv 学术助理团队的主管。你的任务是将用户需求委派（Delegate）给最合适的专家。
         
@@ -587,6 +818,8 @@ arxiv_team = Team(
         【常规任务委派】：
         - 【探索/找新论文】：委派给 `arXiv Researcher`。
         - 【下载指定论文/深度问答某篇论文】：委派给 `Local RAG Expert`。
+        - 【查看论文结构/定理列表】：你可以直接调用 `get_paper_structure` 获取论文大纲（章节、定理、证明、定义）。
+        - 【定理/证明/定义精准问答】：委派给 `Local RAG Expert`，并在指令中明确要求使用 `search_structured` 工具按类型检索。
         
         【重要容错机制】：
         1. 如果用户提问存在指代不明（只说“这篇论文”且上下文中无记录），必须先调用 `list_indexed_papers` 辅助判断，若仍不确定，触发上述“关键拦截”反问。
