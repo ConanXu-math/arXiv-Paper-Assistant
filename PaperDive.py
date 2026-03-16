@@ -18,6 +18,7 @@ from agno.knowledge.reader.pdf_reader import PDFReader  # kept as fallback
 from ocr_pdf_reader import OcrPDFReader
 from structure_extractor import (
     extract_paper_structure,
+    extract_paper_summary,
     find_section_for_page,
     find_elements_on_page,
     format_structure_for_display,
@@ -128,7 +129,7 @@ def _cleanup_stuck_processing():
 import json
 import sqlite3
 
-def _init_structure_table():
+def _init_tables():
     conn = sqlite3.connect(SQLITE_DB_FILE)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS paper_structures ("
@@ -137,10 +138,31 @@ def _init_structure_table():
         "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
         ")"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS paper_pages ("
+        "  paper_id TEXT,"
+        "  page_num INTEGER,"
+        "  content TEXT,"
+        "  PRIMARY KEY (paper_id, page_num)"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS paper_summaries ("
+        "  paper_id TEXT PRIMARY KEY,"
+        "  title TEXT,"
+        "  abstract TEXT,"
+        "  proof_approaches TEXT,"
+        "  core_techniques TEXT,"
+        "  field_tags TEXT,"
+        "  content_tags TEXT,"
+        "  technique_tags TEXT,"
+        "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        ")"
+    )
     conn.commit()
     conn.close()
 
-_init_structure_table()
+_init_tables()
 
 
 def save_paper_structure(paper_id: str, structure: dict) -> None:
@@ -163,6 +185,106 @@ def load_paper_structure(paper_id: str) -> dict | None:
     if row:
         return json.loads(row[0])
     return None
+
+
+# ── paper_pages CRUD ──────────────────────────────────────────
+
+def save_paper_pages(paper_id: str, pages: list[str]) -> None:
+    conn = sqlite3.connect(SQLITE_DB_FILE)
+    for i, content in enumerate(pages):
+        conn.execute(
+            "INSERT OR REPLACE INTO paper_pages (paper_id, page_num, content) VALUES (?, ?, ?)",
+            (paper_id, i + 1, content),
+        )
+    conn.commit()
+    conn.close()
+
+
+def load_paper_pages(paper_id: str, start: int = 1, end: int = 0) -> list[tuple[int, str]]:
+    """Return list of (page_num, content). end=0 means start page only."""
+    if end <= 0:
+        end = start
+    conn = sqlite3.connect(SQLITE_DB_FILE)
+    rows = conn.execute(
+        "SELECT page_num, content FROM paper_pages "
+        "WHERE paper_id = ? AND page_num >= ? AND page_num <= ? ORDER BY page_num",
+        (paper_id, start, end),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_paper_page_count(paper_id: str) -> int:
+    conn = sqlite3.connect(SQLITE_DB_FILE)
+    row = conn.execute(
+        "SELECT MAX(page_num) FROM paper_pages WHERE paper_id = ?",
+        (paper_id,),
+    ).fetchone()
+    conn.close()
+    return row[0] if row and row[0] else 0
+
+
+# ── paper_summaries CRUD ──────────────────────────────────────
+
+def save_paper_summary(paper_id: str, summary: dict) -> None:
+    conn = sqlite3.connect(SQLITE_DB_FILE)
+    conn.execute(
+        "INSERT OR REPLACE INTO paper_summaries "
+        "(paper_id, title, abstract, proof_approaches, core_techniques, "
+        " field_tags, content_tags, technique_tags) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            paper_id,
+            summary.get("title", ""),
+            summary.get("abstract", ""),
+            json.dumps(summary.get("proof_approaches", {}), ensure_ascii=False),
+            json.dumps(summary.get("core_techniques", []), ensure_ascii=False),
+            json.dumps(summary.get("field_tags", []), ensure_ascii=False),
+            json.dumps(summary.get("content_tags", []), ensure_ascii=False),
+            json.dumps(summary.get("technique_tags", []), ensure_ascii=False),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_paper_summary(paper_id: str) -> dict | None:
+    conn = sqlite3.connect(SQLITE_DB_FILE)
+    row = conn.execute(
+        "SELECT title, abstract, proof_approaches, core_techniques, "
+        "field_tags, content_tags, technique_tags FROM paper_summaries WHERE paper_id = ?",
+        (paper_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "title": row[0] or "",
+        "abstract": row[1] or "",
+        "proof_approaches": json.loads(row[2]) if row[2] else {},
+        "core_techniques": json.loads(row[3]) if row[3] else [],
+        "field_tags": json.loads(row[4]) if row[4] else [],
+        "content_tags": json.loads(row[5]) if row[5] else [],
+        "technique_tags": json.loads(row[6]) if row[6] else [],
+    }
+
+
+def load_all_paper_summaries() -> list[dict]:
+    conn = sqlite3.connect(SQLITE_DB_FILE)
+    rows = conn.execute(
+        "SELECT paper_id, title, field_tags, content_tags, technique_tags FROM paper_summaries"
+    ).fetchall()
+    conn.close()
+    results = []
+    for r in rows:
+        results.append({
+            "paper_id": r[0],
+            "title": r[1] or "",
+            "field_tags": json.loads(r[2]) if r[2] else [],
+            "content_tags": json.loads(r[3]) if r[3] else [],
+            "technique_tags": json.loads(r[4]) if r[4] else [],
+        })
+    return results
 
 
 def _build_page_metadata(structure: dict, total_pages: int) -> dict[int, dict]:
@@ -195,6 +317,23 @@ def _extract_and_store_structure(paper_id: str, pages: list[str]) -> dict:
         flush=True,
     )
     return structure
+
+
+def _extract_and_store_summary(paper_id: str, pages: list[str], structure: dict) -> dict | None:
+    """Run LLM summary extraction, store result, return summary dict."""
+    print(f"[摘要] 正在为 {paper_id} 生成高层摘要...", flush=True)
+    summary = extract_paper_summary(pages, structure, llm=shared_llm)
+    if summary:
+        save_paper_summary(paper_id, summary)
+        tags = (
+            summary.get("field_tags", [])
+            + summary.get("content_tags", [])
+            + summary.get("technique_tags", [])
+        )
+        print(f"[摘要] 完成: 标签={', '.join(tags[:6])}", flush=True)
+    else:
+        print(f"[摘要] LLM 摘要提取失败，跳过", flush=True)
+    return summary
 
 
 # ─────────────────────────────────────────────────────────────
@@ -265,12 +404,26 @@ def _perform_scan() -> str:
             )
             success.append(paper_id)
             print(f"[{i}/{total}] 索引完成: {paper_id}", flush=True)
-            # 结构提取是可选增强，失败不影响索引
+            # 持久化 OCR 原文 + 结构/摘要提取（可选增强，失败不影响索引）
             if pdf_reader.last_ocr_pages:
                 try:
-                    _extract_and_store_structure(paper_id, pdf_reader.last_ocr_pages)
+                    save_paper_pages(paper_id, pdf_reader.last_ocr_pages)
+                    print(f"[{i}/{total}] OCR 原文已存储 ({len(pdf_reader.last_ocr_pages)} 页)", flush=True)
+                except Exception as pe:
+                    print(f"[{i}/{total}] 原文存储失败: {pe}", flush=True)
+                structure = None
+                try:
+                    structure = _extract_and_store_structure(paper_id, pdf_reader.last_ocr_pages)
                 except Exception as se:
                     print(f"[{i}/{total}] 结构提取失败（不影响检索）: {se}", flush=True)
+                try:
+                    _extract_and_store_summary(
+                        paper_id,
+                        pdf_reader.last_ocr_pages,
+                        structure or {},
+                    )
+                except Exception as sme:
+                    print(f"[{i}/{total}] 摘要提取失败（不影响检索）: {sme}", flush=True)
         except Exception as e:
             failed.append(f"{pdf_path.name}：{e}")
             print(f"[{i}/{total}] 失败: {paper_id} — {e}", flush=True)
@@ -468,7 +621,13 @@ def load_paper_for_deep_analysis(
         )
 
         structure_info = ""
+        summary_info = ""
         if pdf_reader.last_ocr_pages:
+            try:
+                save_paper_pages(arxiv_id, pdf_reader.last_ocr_pages)
+            except Exception as pe:
+                print(f"[原文] 存储失败: {pe}", flush=True)
+            structure = None
             try:
                 structure = _extract_and_store_structure(arxiv_id, pdf_reader.last_ocr_pages)
                 n_thm = len(structure.get("theorems", []))
@@ -477,16 +636,24 @@ def load_paper_for_deep_analysis(
                 structure_info = f"\n结构提取：{n_sec} 个章节, {n_thm} 个定理/引理, {n_def} 个定义"
             except Exception as se:
                 print(f"[结构] 提取失败（不影响检索）: {se}", flush=True)
+            try:
+                sm = _extract_and_store_summary(arxiv_id, pdf_reader.last_ocr_pages, structure or {})
+                if sm:
+                    tags = sm.get("field_tags", []) + sm.get("technique_tags", [])
+                    summary_info = f"\n摘要标签：{', '.join(tags[:4])}"
+            except Exception as sme:
+                print(f"[摘要] 提取失败（不影响检索）: {sme}", flush=True)
 
         title_line = f"\n论文标题：{title}" if title else ""
         return (
             f"论文 **{arxiv_id}** 已成功下载并索引至知识库！{title_line}"
-            f"{structure_info}\n\n"
+            f"{structure_info}{summary_info}\n\n"
             f"原文链接：{abs_url}\n"
             f"本地缓存：{local_pdf_path}\n\n"
             f"现在可以就该论文的任何内容提问，"
             f"我将严格基于论文原文给出带引用的精准回答。\n"
-            f"可使用 `get_paper_structure` 查看论文结构大纲。\n"
+            f"可使用 `browse_paper_catalog` 浏览论文索引，"
+            f"或 `get_paper_overview` 查看详细概要。\n"
             f"（若论文中未涉及您的问题，我会明确告知。）"
         )
 
@@ -726,6 +893,226 @@ def search_structured(
 
 
 # ─────────────────────────────────────────────────────────────
+# 工具定义：三级递进（全局索引 → 概要 → 深读）
+# ─────────────────────────────────────────────────────────────
+
+
+@tool
+def browse_paper_catalog() -> str:
+    """
+    返回所有已索引论文的紧凑索引：每篇含标题和三维标签（领域/内容/技巧）。
+
+    【调用时机】：
+    - 用户提问时，先调用此工具浏览全局索引，挑出可能相关的论文
+    - 用户问"有哪些论文"、"知识库里有什么"时
+
+    Returns:
+        紧凑论文目录，每篇 2 行（标题 + 三维标签），适合一次性通读筛选。
+    """
+    summaries = load_all_paper_summaries()
+    if not summaries:
+        indexed = _get_indexed_names()
+        if not indexed:
+            return "知识库为空，请先添加论文。"
+        lines = [f"知识库有 {len(indexed)} 篇论文（尚无摘要信息，可能需要重新索引）："]
+        for i, name in enumerate(sorted(indexed), 1):
+            lines.append(f"  {i}. [{name}]")
+        return "\n".join(lines)
+
+    lines = [f"论文索引（共 {len(summaries)} 篇）：\n"]
+    for i, s in enumerate(summaries, 1):
+        pid = s["paper_id"]
+        title = s["title"] or pid
+        field = ", ".join(s.get("field_tags", [])) or "—"
+        content = ", ".join(s.get("content_tags", [])) or "—"
+        technique = ", ".join(s.get("technique_tags", [])) or "—"
+        lines.append(f"{i}. [{pid}] {title}")
+        lines.append(f"   领域: {field} | 内容: {content} | 技巧: {technique}")
+    lines.append(f"\n提示：对感兴趣的论文调用 get_paper_overview(paper_id) 查看详细概要。")
+    return "\n".join(lines)
+
+
+@tool
+def get_paper_overview(paper_id: str) -> str:
+    """
+    获取论文的详细概要：主要内容、章节结构、证明思路、核心技巧。
+
+    【调用时机】：
+    - 通过 browse_paper_catalog 筛出候选后，逐篇调用此工具精选
+    - 用户问某篇论文"讲了什么"、"主要内容"、"创新点"时
+
+    Args:
+        paper_id: 论文在知识库中的名称（通常是 arXiv ID 或文件名）
+
+    Returns:
+        格式化的论文详细概要（Markdown）。
+    """
+    summary = load_paper_summary(paper_id)
+    structure = load_paper_structure(paper_id)
+
+    if not summary and not structure:
+        return (
+            f"未找到论文 {paper_id} 的概要或结构数据。\n"
+            f"可能原因：该论文在此功能上线前已索引。\n"
+            f"建议：删除后重新加载以触发摘要提取。"
+        )
+
+    lines: list[str] = []
+
+    if summary:
+        title = summary.get("title", paper_id)
+        lines.append(f"# {title}\n")
+
+        field_tags = summary.get("field_tags", [])
+        content_tags = summary.get("content_tags", [])
+        technique_tags = summary.get("technique_tags", [])
+        if field_tags or content_tags or technique_tags:
+            lines.append(f"**领域**: {', '.join(field_tags) if field_tags else '—'}")
+            lines.append(f"**内容**: {', '.join(content_tags) if content_tags else '—'}")
+            lines.append(f"**技巧**: {', '.join(technique_tags) if technique_tags else '—'}\n")
+
+        abstract = summary.get("abstract", "")
+        if abstract:
+            lines.append(f"## 主要内容\n{abstract}\n")
+
+        core_techniques = summary.get("core_techniques", [])
+        if core_techniques:
+            lines.append("## 核心技巧")
+            for t in core_techniques:
+                lines.append(f"- {t}")
+            lines.append("")
+
+        proof_approaches = summary.get("proof_approaches", {})
+        if proof_approaches:
+            lines.append("## 证明思路")
+            for thm, approach in proof_approaches.items():
+                lines.append(f"- **{thm}**: {approach}")
+            lines.append("")
+
+    if structure:
+        sections = structure.get("sections", [])
+        if sections:
+            lines.append("## 章节大纲")
+            for sec in sections:
+                indent = "  " * (sec.get("level", 1) - 1)
+                lines.append(f"{indent}- **{sec['id']}** {sec.get('title', '')} (p.{sec.get('page', '?')})")
+            lines.append("")
+
+        theorems = structure.get("theorems", [])
+        if theorems:
+            lines.append("## 定理/引理")
+            for thm in theorems:
+                stmt = thm.get("statement", "")[:120]
+                lines.append(f"- **{thm.get('label', thm['id'])}** (p.{thm.get('page', '?')}): {stmt}")
+            lines.append("")
+
+    page_count = get_paper_page_count(paper_id)
+    if page_count:
+        lines.append(f"---\n全文共 {page_count} 页，可用 `read_paper_pages` 或 `read_paper_section` 深读原文。")
+
+    return "\n".join(lines) if lines else f"论文 {paper_id} 的概要信息为空。"
+
+
+@tool
+def read_paper_pages(paper_id: str, start_page: int, end_page: int = 0) -> str:
+    """
+    读取论文指定页的 OCR 原文。
+
+    【调用时机】：
+    - 看完概要后需要深读某几页原文时
+    - 需要查看某个证明、定义的完整内容时
+
+    Args:
+        paper_id: 论文 ID
+        start_page: 起始页码（从 1 开始）
+        end_page: 结束页码（包含），为 0 时只读 start_page 一页
+
+    Returns:
+        指定页的 OCR 原文。
+    """
+    if end_page <= 0:
+        end_page = start_page
+    if start_page < 1:
+        return "页码必须从 1 开始。"
+    if end_page - start_page > 10:
+        return "一次最多读取 10 页，请缩小范围。"
+
+    total = get_paper_page_count(paper_id)
+    if total == 0:
+        return f"未找到论文 {paper_id} 的原文数据。可能需要重新索引。"
+
+    rows = load_paper_pages(paper_id, start_page, end_page)
+    if not rows:
+        return f"论文 {paper_id} 没有第 {start_page}-{end_page} 页的数据（全文共 {total} 页）。"
+
+    lines = [f"论文 {paper_id} 第 {start_page}-{end_page} 页（共 {total} 页）：\n"]
+    for page_num, content in rows:
+        lines.append(f"--- 第 {page_num} 页 ---")
+        lines.append(content if content else "[空白页]")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+@tool
+def read_paper_section(paper_id: str, section_id: str) -> str:
+    """
+    读取论文指定章节的原文（根据结构自动定位页码范围）。
+
+    【调用时机】：
+    - 看完概要后需要深读某个章节时
+    - 用户说"读第3章"、"看 section 2.1"时
+
+    Args:
+        paper_id: 论文 ID
+        section_id: 章节 ID（如 "sec1", "sec2.1"），可从 get_paper_overview 获取
+
+    Returns:
+        该章节覆盖页的 OCR 原文。
+    """
+    structure = load_paper_structure(paper_id)
+    if not structure:
+        return f"未找到论文 {paper_id} 的结构数据。"
+
+    sections = structure.get("sections", [])
+    target = None
+    target_idx = -1
+    for idx, sec in enumerate(sections):
+        if sec["id"] == section_id or sec.get("title", "").lower() == section_id.lower():
+            target = sec
+            target_idx = idx
+            break
+
+    if not target:
+        available = ", ".join(f"{s['id']}({s.get('title', '')})" for s in sections)
+        return f"未找到章节 {section_id}。可用章节：{available}"
+
+    start_page = target.get("page", 1)
+    if target_idx + 1 < len(sections):
+        end_page = sections[target_idx + 1].get("page", start_page)
+        if end_page > start_page:
+            end_page -= 1
+    else:
+        total = get_paper_page_count(paper_id)
+        end_page = total if total > 0 else start_page
+
+    end_page = min(end_page, start_page + 9)
+
+    rows = load_paper_pages(paper_id, start_page, end_page)
+    if not rows:
+        return f"未找到论文 {paper_id} 第 {start_page}-{end_page} 页的原文数据。"
+
+    sec_title = target.get("title", section_id)
+    lines = [f"章节 [{section_id}] {sec_title}（p.{start_page}-{end_page}）：\n"]
+    for page_num, content in rows:
+        lines.append(f"--- 第 {page_num} 页 ---")
+        lines.append(content if content else "[空白页]")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────
 # Agent 构建
 # ─────────────────────────────────────────────────────────────
 
@@ -748,6 +1135,10 @@ rag_expert = Agent(
         scan_and_index_new_papers,
         list_indexed_papers,
         load_paper_for_deep_analysis,
+        browse_paper_catalog,
+        get_paper_overview,
+        read_paper_pages,
+        read_paper_section,
         get_paper_structure,
         search_structured,
         save_note,
@@ -758,39 +1149,31 @@ rag_expert = Agent(
     add_knowledge_to_context=True,
     instructions=dedent("""
         你是本地文献精读专家。
-        绝对红线：回答论文内容必须且只能基于知识库检索结果！
-        
-        【工具调用严格规范 - 必读】：
-        你的可用工具包括：
-        - `search_knowledge_base`：语义检索论文内容（通用）
-        - `get_paper_structure`：获取论文结构大纲（章节、定理、证明、定义列表）
-        - `search_structured`：按结构类型精准检索（支持 element_type 过滤）
-        - `list_indexed_papers`：查看论文列表
-        - `save_note` / `list_notes`：笔记管理
-        严禁将工具名称拼接或修改！必须准确使用上述工具名。
+        绝对红线：回答论文内容必须且只能基于工具返回的结果！
 
-        【数学论文精读策略 - 必读】：
-        1. 收到关于某篇论文的问题时，先调用 `get_paper_structure` 获取论文结构大纲。
-        2. 若用户问定理/证明/定义相关问题，用 `search_structured` 按 element_type 精准检索。
-           例如：问"定理3.1是什么" → search_structured(query="Theorem 3.1", element_type="theorem")
-                 问"定理3.1怎么证明的" → search_structured(query="proof of Theorem 3.1", element_type="proof")
-                 问"XX的定义" → search_structured(query="definition of XX", element_type="definition")
-        3. 若用户问"定理X怎么证明的"，先搜 element_type="proof" 找到证明，
-           再搜 element_type="theorem" 找到定理陈述，一起呈现。
-        4. 回答时引用格式：[Theorem 3.1, p.5] 或 [Definition 2.1, p.3]。
-        5. 若涉及公式推导，按证明步骤逐步展示，保留 LaTeX 格式（用 $ 或 $$ 包裹）。
+        【三级递进检索策略 - 核心工作流（必读）】：
+        回答任何论文相关问题时，严格按以下三级递进：
+        1. 第一级筛选：调用 `browse_paper_catalog()` 浏览全局索引（标题+三维标签），
+           根据用户问题从领域/内容/技巧三个维度挑出可能相关的论文 ID。
+        2. 第二级精选：对候选论文逐篇调用 `get_paper_overview(paper_id)`，
+           阅读详细摘要、证明思路、核心技巧，判断哪篇真正能回答问题。
+        3. 第三级深读：确认需要看原文时：
+           - 看某章节 → `read_paper_section(paper_id, section_id)`
+           - 看某几页 → `read_paper_pages(paper_id, start_page, end_page)`
+        4. 兜底：如果以上都找不到精确答案，再用 `search_knowledge_base()` 向量模糊检索。
 
-        【高级检索技巧 - 必读】：
-        当用户或主管要求你"研究"、"总结"某篇论文时：
-        1. 先调用 `get_paper_structure` 了解全貌
-        2. 再用 `search_knowledge_base` 检索 "Abstract, Introduction, main contribution, conclusion"
-        3. 结合结构大纲和检索结果，给出带结构化引用的总结
+        【定理/证明精准检索】：
+        - 用户问某个定理 → 先从 overview 的定理列表定位页码，再用 read_paper_pages 读原文
+        - 用户问证明思路 → 先看 overview 中的 proof_approaches，需要细节再 read_paper_section
+        - 也可用 `search_structured(query, element_type="theorem/proof/definition")` 辅助
 
-        如果检索不到，明确回答"知识库中未找到相关内容"，绝不允许自己编造！
-        每次陈述必须带上引用标识（如 [Theorem 3.1, p.5] 或 [第3页]）。
+        【回答格式要求】：
+        - 引用格式：[Theorem 3.1, p.5] 或 [第3页]
+        - 公式保留 LaTeX 格式（$ 或 $$ 包裹）
+        - 如果检索不到，明确说"知识库中未找到"，绝不编造
 
         【笔记保存】：
-        当用户要求保存总结或笔记时，使用 `save_note` 工具，提供文件名（不含扩展名）和内容。使用 `list_notes` 查看已有笔记。
+        使用 `save_note` / `list_notes` 管理笔记。
     """),
     markdown=True,
 )
@@ -805,25 +1188,31 @@ arxiv_team = Team(
     num_history_runs=10,
     add_history_to_context=True,
     enable_agentic_memory=True,
-    tools=[list_indexed_papers, get_paper_structure, save_note, list_notes],
+    tools=[browse_paper_catalog, get_paper_overview, list_indexed_papers, save_note, list_notes],
     instructions=dedent("""
         你是 arXiv 学术助理团队的主管。你的任务是将用户需求委派（Delegate）给最合适的专家。
         
+        【核心工作流：三级递进（必读）】
+        回答论文相关问题时，你和 RAG Expert 应遵循三级递进策略：
+        1. 第一级：调用 `browse_paper_catalog()` 浏览全局索引（标题+领域/内容/技巧标签），快速筛出候选
+        2. 第二级：对候选调用 `get_paper_overview(paper_id)` 看详细摘要和证明思路
+        3. 第三级：委派 `Local RAG Expert` 用 `read_paper_section` 或 `read_paper_pages` 深读原文
+
         【核心状态管理：当前研究论文（Focus Paper）】
-        1. 你必须通过对话历史记住用户当前正在“研究”、“阅读”或“聚焦”的某篇论文（Focus Paper）。
-        2. 当用户明确表示要研究某篇论文时（例如“我要研究 2401.12345”或“看看第一篇”），将其设为当前的 Focus Paper。
-        3. 之后，只要用户提问（如“它的创新点是什么？”、“讲了什么？”），就算他们没提论文名，你也要**默认**他们是在问这篇 Focus Paper。在委派给 `Local RAG Expert` 时，**必须在指令中强行加上这篇论文的名称或ID**（例如：“请在 2401.12345 中检索创新点”）。
-        4. **关键拦截（强制）**：如果用户问了一个关于论文的具体问题，但当前上下文中**没有** Focus Paper，你也完全**不知道**他在说哪篇，**绝对不允许盲目搜索或瞎猜！** 你必须直接反问用户：“请问您具体想问哪篇文章？”
+        1. 通过对话历史记住用户当前聚焦的论文（Focus Paper）。
+        2. 当用户表示要研究某篇时，将其设为 Focus Paper。
+        3. 之后用户提问若未指明论文，默认问的是 Focus Paper。委派 RAG Expert 时必须带上论文 ID。
+        4. **关键拦截**：无 Focus Paper 且指代不明时，必须反问。
         
-        【常规任务委派】：
-        - 【探索/找新论文】：委派给 `arXiv Researcher`。
-        - 【下载指定论文/深度问答某篇论文】：委派给 `Local RAG Expert`。
-        - 【查看论文结构/定理列表】：你可以直接调用 `get_paper_structure` 获取论文大纲（章节、定理、证明、定义）。
-        - 【定理/证明/定义精准问答】：委派给 `Local RAG Expert`，并在指令中明确要求使用 `search_structured` 工具按类型检索。
-        
-        【重要容错机制】：
-        1. 如果用户提问存在指代不明（只说“这篇论文”且上下文中无记录），必须先调用 `list_indexed_papers` 辅助判断，若仍不确定，触发上述“关键拦截”反问。
-        2. 当用户要求“研究”或“总结”某篇论文时，你在委派给 RAG Expert 时必须明确下达具体指令。例如：“请检索 2603.11046v1 的 Abstract 和 Conclusion，并用中文总结核心创新点”。不要只泛泛地说“研究这篇”。
+        【任务委派】：
+        - 【探索/找新论文】：委派 `arXiv Researcher`
+        - 【下载论文/深度问答/读原文】：委派 `Local RAG Expert`
+        - 【快速了解论文概况】：你可直接调用 `browse_paper_catalog` 或 `get_paper_overview`
+        - 【需要读原文细节】：委派 RAG Expert，明确指令要求用 read_paper_section/read_paper_pages
+
+        【委派规范】：
+        委派 RAG Expert 时必须下达具体指令，如：“请调用 get_paper_overview('sat-matching') 获取概要，
+        然后用 read_paper_section 读取第3章的原文，总结核心创新点”。不要泛泛地说“研究这篇”。
     """),
     markdown=True,
     stream=True,

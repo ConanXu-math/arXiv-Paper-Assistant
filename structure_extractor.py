@@ -268,6 +268,121 @@ def find_elements_on_page(structure: dict, page_num: int) -> list[str]:
     return sorted(types)
 
 
+# ── Paper summary extraction (LLM) ────────────────────────────────
+
+_SUMMARY_PROMPT = """\
+你是一个数学论文分析专家。请阅读以下论文的结构骨架和 OCR 原文，生成一份高层概要。
+
+要求：
+1. title: 论文标题
+2. abstract: 1-2 段概述论文的主要研究内容和贡献（中文）
+3. proof_approaches: 每个主要定理的证明思路（1-2句），格式为 {{"Theorem 3.1": "通过构造...", ...}}
+4. core_techniques: 论文用到的核心方法/技巧列表（如 ["鸽巢原理", "概率方法"]）
+5. field_tags: 论文所属数学领域，选 2-3 个（如 ["图论", "组合优化"]）
+6. content_tags: 论文研究内容的关键词，选 2-4 个（如 ["匹配存在性条件", "Hall定理推广"]）
+7. technique_tags: 论文用到的方法/技巧关键词，选 2-4 个（如 ["构造性证明", "鸽巢原理"]）
+
+注意：
+- field_tags 描述论文属于哪个数学分支/领域
+- content_tags 描述论文"做了什么"（研究的具体问题）
+- technique_tags 描述论文"怎么做的"（用了什么方法/工具）
+- 三类标签不要重复，各自侧重不同维度
+
+严格输出 JSON，不要加 ```json 或其他标记：
+{{
+  "title": "...",
+  "abstract": "...",
+  "proof_approaches": {{"Theorem X": "...", ...}},
+  "core_techniques": ["...", ...],
+  "field_tags": ["...", ...],
+  "content_tags": ["...", ...],
+  "technique_tags": ["...", ...]
+}}
+
+=== 论文结构骨架 ===
+{structure_skeleton}
+
+=== 论文原文（前 8000 字） ===
+{paper_text}
+"""
+
+
+def extract_paper_summary(
+    pages: list[str],
+    structure: dict,
+    llm: Any,
+) -> Optional[dict]:
+    """Use LLM to generate a high-level summary with multi-dimensional tags.
+
+    Args:
+        pages: list of per-page OCR text strings.
+        structure: structure dict from extract_paper_structure().
+        llm: an agno OpenAILike model instance.
+
+    Returns:
+        Summary dict with title, abstract, proof_approaches, core_techniques,
+        field_tags, content_tags, technique_tags. None on failure.
+    """
+    skeleton_parts = []
+    if structure.get("title"):
+        skeleton_parts.append(f"标题: {structure['title']}")
+    if structure.get("summary"):
+        skeleton_parts.append(f"概要: {structure['summary']}")
+    for sec in structure.get("sections", []):
+        indent = "  " * (sec.get("level", 1) - 1)
+        skeleton_parts.append(f"{indent}[{sec['id']}] {sec.get('title', '')} (p.{sec.get('page', '?')})")
+    for thm in structure.get("theorems", []):
+        skeleton_parts.append(f"  {thm.get('label', thm['id'])}: {thm.get('statement', '')[:100]}")
+    for defn in structure.get("definitions", []):
+        skeleton_parts.append(f"  {defn.get('label', defn['id'])}: {defn.get('content', '')[:80]}")
+    skeleton_text = "\n".join(skeleton_parts) if skeleton_parts else "(无结构信息)"
+
+    full_text = "\n\n".join(
+        f"[第{i+1}页]\n{t}" for i, t in enumerate(pages) if t.strip()
+    )
+    truncated = full_text[:8000]
+
+    prompt = _SUMMARY_PROMPT.format(
+        structure_skeleton=skeleton_text,
+        paper_text=truncated,
+    )
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key=llm.api_key,
+            base_url=str(llm.base_url),
+        )
+        response = client.chat.completions.create(
+            model=llm.id,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=4096,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        if not raw:
+            logger.warning("LLM summary returned empty response")
+            return None
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+        brace_start = raw.find("{")
+        brace_end = raw.rfind("}")
+        if brace_start != -1 and brace_end > brace_start:
+            raw = raw[brace_start : brace_end + 1]
+        result = json.loads(raw)
+        expected_keys = {"title", "abstract", "proof_approaches", "core_techniques",
+                         "field_tags", "content_tags", "technique_tags"}
+        for key in expected_keys:
+            if key not in result:
+                result[key] = {} if key == "proof_approaches" else ([] if key != "title" and key != "abstract" else "")
+        return result
+    except Exception as e:
+        logger.warning("LLM summary extraction failed: %s", e)
+        return None
+
+
 def format_structure_for_display(structure: dict) -> str:
     """Format structure dict into readable markdown text for the agent."""
     lines: list[str] = []
