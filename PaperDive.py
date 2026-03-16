@@ -1113,6 +1113,152 @@ def read_paper_section(paper_id: str, section_id: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
+# 工具定义：删除 / 重索引
+# ─────────────────────────────────────────────────────────────
+
+_ALL_TARGETS = ["vector", "structure", "summary", "pages"]
+
+
+def _delete_paper_data(paper_id: str, targets: list[str]) -> list[str]:
+    """Delete specified data for a paper. Returns list of successfully deleted targets."""
+    if "all" in targets:
+        targets = list(_ALL_TARGETS)
+
+    deleted: list[str] = []
+
+    if "vector" in targets:
+        try:
+            contents, _ = shared_knowledge.get_content()
+            for c in contents:
+                if c.name == paper_id and c.id is not None:
+                    shared_knowledge.remove_content_by_id(c.id)
+            deleted.append("vector")
+        except Exception as e:
+            print(f"[删除] 向量数据删除失败: {e}", flush=True)
+
+    conn = sqlite3.connect(SQLITE_DB_FILE)
+    try:
+        if "structure" in targets:
+            conn.execute("DELETE FROM paper_structures WHERE paper_id = ?", (paper_id,))
+            deleted.append("structure")
+        if "summary" in targets:
+            conn.execute("DELETE FROM paper_summaries WHERE paper_id = ?", (paper_id,))
+            deleted.append("summary")
+        if "pages" in targets:
+            conn.execute("DELETE FROM paper_pages WHERE paper_id = ?", (paper_id,))
+            deleted.append("pages")
+        conn.commit()
+    except Exception as e:
+        print(f"[删除] SQLite 数据删除失败: {e}", flush=True)
+    finally:
+        conn.close()
+
+    return deleted
+
+
+@tool
+def delete_paper_data(paper_id: str, targets: str = "all") -> str:
+    """
+    选择性删除论文的索引数据。
+
+    【调用时机】：
+    - 用户说"删除某篇论文"、"清除索引"时
+    - 需要只更新部分数据（如重新生成摘要）时
+
+    Args:
+        paper_id: 论文 ID（如 sat-matching 或 2301.12345）
+        targets: 要删除的数据类型，逗号分隔。可选值：
+                 vector（向量嵌入）、structure（结构）、summary（摘要标签）、
+                 pages（OCR原文）、all（全部，默认）
+                 例如："summary,pages" 只删摘要和原文
+
+    Returns:
+        删除结果说明。
+    """
+    target_list = [t.strip() for t in targets.split(",") if t.strip()]
+    if not target_list:
+        target_list = ["all"]
+
+    invalid = [t for t in target_list if t not in _ALL_TARGETS + ["all"]]
+    if invalid:
+        return f"无效的 targets: {invalid}。可选值: vector, structure, summary, pages, all"
+
+    deleted = _delete_paper_data(paper_id, target_list)
+    if not deleted:
+        return f"论文 {paper_id} 没有找到可删除的数据。"
+
+    return f"已删除论文 **{paper_id}** 的以下数据：{', '.join(deleted)}。\n可调用 `reindex_paper` 重新索引，或 `scan_and_index_new_papers` 扫描。"
+
+
+@tool
+def reindex_paper(paper_id: str) -> str:
+    """
+    删除论文全部索引数据并重新执行完整索引流程（OCR → 存原文 → 结构提取 → 摘要生成 → 向量嵌入）。
+
+    【调用时机】：
+    - 用户说"重新索引"、"重建索引"时
+    - 旧论文缺少摘要/原文数据，需要走新流程时
+
+    Args:
+        paper_id: 论文 ID（如 sat-matching 或 2301.12345）
+
+    Returns:
+        重索引结果。
+    """
+    pdf_path = PAPERS_DIR / f"{paper_id}.pdf"
+    if not pdf_path.exists():
+        return f"未找到论文 PDF 文件：{pdf_path}\n请确认 paper_id 正确，或先下载论文。"
+
+    print(f"[重索引] 正在删除 {paper_id} 的旧数据...", flush=True)
+    deleted = _delete_paper_data(paper_id, ["all"])
+    print(f"[重索引] 已清除: {', '.join(deleted) if deleted else '无旧数据'}", flush=True)
+
+    print(f"[重索引] 开始重新索引 {paper_id}...", flush=True)
+    try:
+        shared_knowledge.insert(
+            name=paper_id,
+            path=str(pdf_path),
+            reader=pdf_reader,
+            skip_if_exists=True,
+        )
+        print(f"[重索引] 向量嵌入完成", flush=True)
+
+        structure_info = ""
+        summary_info = ""
+        if pdf_reader.last_ocr_pages:
+            try:
+                save_paper_pages(paper_id, pdf_reader.last_ocr_pages)
+                print(f"[重索引] OCR 原文已存储 ({len(pdf_reader.last_ocr_pages)} 页)", flush=True)
+            except Exception as pe:
+                print(f"[重索引] 原文存储失败: {pe}", flush=True)
+
+            structure = None
+            try:
+                structure = _extract_and_store_structure(paper_id, pdf_reader.last_ocr_pages)
+                n_sec = len(structure.get("sections", []))
+                n_thm = len(structure.get("theorems", []))
+                n_def = len(structure.get("definitions", []))
+                structure_info = f"\n结构提取：{n_sec} 个章节, {n_thm} 个定理/引理, {n_def} 个定义"
+            except Exception as se:
+                print(f"[重索引] 结构提取失败: {se}", flush=True)
+
+            try:
+                sm = _extract_and_store_summary(paper_id, pdf_reader.last_ocr_pages, structure or {})
+                if sm:
+                    tags = sm.get("field_tags", []) + sm.get("technique_tags", [])
+                    summary_info = f"\n摘要标签：{', '.join(tags[:4])}"
+            except Exception as sme:
+                print(f"[重索引] 摘要提取失败: {sme}", flush=True)
+
+        return (
+            f"论文 **{paper_id}** 重新索引完成！{structure_info}{summary_info}\n\n"
+            f"可用 `browse_paper_catalog` 查看索引，或 `get_paper_overview('{paper_id}')` 查看概要。"
+        )
+    except Exception as e:
+        return f"重索引失败：{e}"
+
+
+# ─────────────────────────────────────────────────────────────
 # Agent 构建
 # ─────────────────────────────────────────────────────────────
 
@@ -1141,6 +1287,8 @@ rag_expert = Agent(
         read_paper_section,
         get_paper_structure,
         search_structured,
+        delete_paper_data,
+        reindex_paper,
         save_note,
         list_notes,
     ],
@@ -1209,6 +1357,7 @@ arxiv_team = Team(
         - 【下载论文/深度问答/读原文】：委派 `Local RAG Expert`
         - 【快速了解论文概况】：你可直接调用 `browse_paper_catalog` 或 `get_paper_overview`
         - 【需要读原文细节】：委派 RAG Expert，明确指令要求用 read_paper_section/read_paper_pages
+        - 【删除/重索引论文】：委派 RAG Expert 调用 `delete_paper_data` 或 `reindex_paper`
 
         【委派规范】：
         委派 RAG Expert 时必须下达具体指令，如：“请调用 get_paper_overview('sat-matching') 获取概要，
