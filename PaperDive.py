@@ -40,6 +40,7 @@ PAPERS_DIR = BASE_DIR / "arxiv_test" / "papers"
 NOTES_DIR = BASE_DIR / "notes"
 SQLITE_DB_FILE = str(BASE_DIR / "arxiv_test" / "state.db")
 LANCEDB_URI = str(BASE_DIR / "arxiv_test" / "lancedb")
+TEAM_SESSION_ID = "arxiv-team-v4"
 
 PAPERS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -125,6 +126,40 @@ def _cleanup_stuck_processing():
             print(f"[清理] 已移除 {n} 条卡住的索引记录，将重新索引。", flush=True)
     except Exception:
         pass
+
+
+_POLLUTION_PATTERNS = ["<function=", "</tool_call>", "<parameter="]
+
+
+def _cleanup_polluted_session():
+    """检测并清除 session 历史中被污染的工具调用记录。
+
+    当 LLM 尝试调用未注册的工具时会输出原始文本（如 <function=...>），
+    这些错误模式被持久化到 session 后会导致后续对话持续模仿。
+    """
+    try:
+        conn = sqlite3.connect(SQLITE_DB_FILE)
+        row = conn.execute(
+            "SELECT runs FROM agent_sessions WHERE session_id = ?",
+            (TEAM_SESSION_ID,),
+        ).fetchone()
+        if not row or not row[0]:
+            conn.close()
+            return
+        runs_text = row[0]
+        if any(p in runs_text for p in _POLLUTION_PATTERNS):
+            conn.execute(
+                "DELETE FROM agent_sessions WHERE session_id = ?",
+                (TEAM_SESSION_ID,),
+            )
+            conn.commit()
+            print(
+                f"[清理] 检测到对话历史包含异常工具调用模式，已自动清除以确保工具正常执行。",
+                flush=True,
+            )
+        conn.close()
+    except Exception as e:
+        print(f"[清理] session 检测失败（不影响使用）: {e}", flush=True)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -292,6 +327,46 @@ def load_all_paper_summaries() -> list[dict]:
     return results
 
 
+def diagnose_paper(paper_id: str) -> str:
+    """
+    诊断某篇论文在本地库中的结构/摘要/原文状态（用于排查「结构数据暂时无法获取」等问题）。
+    可在项目根目录运行: python -c "from PaperDive import diagnose_paper; print(diagnose_paper('sat-matching'))"
+    """
+    lines = [f"论文 ID: {paper_id}", "─" * 40]
+    pdf_path = PAPERS_DIR / f"{paper_id}.pdf"
+    lines.append(f"PDF 文件: {'存在' if pdf_path.exists() else '不存在'}")
+    # 知识库向量
+    try:
+        contents, _ = shared_knowledge.get_content()
+        vec_count = sum(1 for c in contents if c.name == paper_id)
+        lines.append(f"向量块数: {vec_count}")
+    except Exception as e:
+        lines.append(f"向量: 查询异常 — {e}")
+    # 结构
+    st = load_paper_structure(paper_id)
+    if st is None:
+        lines.append("结构: 无")
+    else:
+        n_sec = len(st.get("sections", []))
+        n_thm = len(st.get("theorems", []))
+        n_def = len(st.get("definitions", []))
+        lines.append(f"结构: 有 — {n_sec} 章节, {n_thm} 定理/引理, {n_def} 定义")
+        raw = json.dumps(st, ensure_ascii=False)[:300]
+        lines.append(f"结构预览: {raw}...")
+    # 摘要
+    sm = load_paper_summary(paper_id)
+    if sm is None:
+        lines.append("摘要: 无")
+    else:
+        title = (sm.get("title") or "")[:60]
+        lines.append(f"摘要: 有 — title: {title}...")
+    # 原文页数
+    n_pages = get_paper_page_count(paper_id)
+    lines.append(f"原文页数: {n_pages}")
+    lines.append("─" * 40)
+    return "\n".join(lines)
+
+
 def _build_page_metadata(structure: dict, total_pages: int) -> dict[int, dict]:
     """Build per-page metadata dict from a structure for OcrPDFReader."""
     metadata: dict[int, dict] = {}
@@ -310,10 +385,27 @@ def _build_page_metadata(structure: dict, total_pages: int) -> dict[int, dict]:
 
 
 def _extract_and_store_structure(paper_id: str, pages: list[str]) -> dict:
-    """Run two-phase structure extraction, store result, return structure."""
+    """Run two-phase structure extraction, store result, return structure.
+    On any failure (LLM/timeout/JSON), falls back to regex-only and still saves.
+    """
     print(f"[结构] 正在提取 {paper_id} 的论文结构...", flush=True)
-    structure = extract_paper_structure(pages, llm=shared_llm)
-    save_paper_structure(paper_id, structure)
+    structure = None
+    try:
+        structure = extract_paper_structure(pages, llm=shared_llm)
+    except Exception as e:
+        print(f"[结构] 完整提取异常，改用仅正则结果: {e}", flush=True)
+        try:
+            structure = extract_paper_structure(pages, llm=None)
+        except Exception as e2:
+            print(f"[结构] 正则提取也失败: {e2}", flush=True)
+            structure = {"sections": [], "theorems": [], "proofs": [], "definitions": [], "key_equations": []}
+    if structure is None:
+        structure = {"sections": [], "theorems": [], "proofs": [], "definitions": [], "key_equations": []}
+    try:
+        save_paper_structure(paper_id, structure)
+    except Exception as se:
+        print(f"[结构] 写入数据库失败: {se}", flush=True)
+        raise
     n_thm = len(structure.get("theorems", []))
     n_def = len(structure.get("definitions", []))
     n_sec = len(structure.get("sections", []))
@@ -1264,78 +1356,121 @@ def reindex_paper(paper_id: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# Agent 构建
+# Agent 构建（4 角色架构）
 # ─────────────────────────────────────────────────────────────
 
-# 1. 角色 A：外网情报员
+# 1. arXiv Researcher — 外网检索 + 下载
 arxiv_researcher = Agent(
     name="arXiv Researcher",
-    role="负责在 arXiv 上检索前沿学术论文",
+    role="负责在 arXiv 上检索、下载论文并触发索引",
     model=shared_llm,
-    tools=[search_arxiv_papers],
-    instructions="当用户需要寻找新方向、推荐论文时，你负责调用工具检索 arXiv，返回论文标题、摘要和 ID。",
+    tools=[search_arxiv_papers, load_paper_for_deep_analysis],
+    instructions=dedent("""
+        你是外网论文情报员。职责：
+        1. 用户需要找新论文时，调用 `search_arxiv_papers` 检索 arXiv
+        2. 用户指定要下载/加载某篇时，调用 `load_paper_for_deep_analysis` 下载并索引
+        3. 返回论文标题、摘要、arXiv ID，让用户选择
+
+        注意：
+        - 下载后论文会自动完成索引（OCR + 结构提取 + 摘要生成 + 向量嵌入）
+        - 若用户说"加载第N篇"，从你之前的搜索结果中找到对应 ID 再调用下载
+    """),
     markdown=True,
 )
 
-# 2. 角色 B：本地文献专家（拥有知识库）
-rag_expert = Agent(
-    name="Local RAG Expert",
-    role="负责本地 PDF 管理与基于知识库的深度精读问答",
+# 2. Paper Librarian — 索引管理专员
+paper_librarian = Agent(
+    name="Paper Librarian",
+    role="负责论文索引的扫描、删除和重建",
     model=shared_llm,
     tools=[
         scan_and_index_new_papers,
+        delete_paper_data,
+        reindex_paper,
         list_indexed_papers,
-        load_paper_for_deep_analysis,
+    ],
+    instructions=dedent("""
+        你是论文管理员，负责知识库的索引维护。职责：
+
+        【扫描索引】：
+        - 调用 `scan_and_index_new_papers` 扫描新论文并自动索引
+
+        【删除数据】：
+        - 调用 `delete_paper_data(paper_id, targets)` 选择性删除
+        - targets 可选: vector, structure, summary, pages, all
+        - 执行前简要说明将删除什么，执行后报告结果
+
+        【重新索引】：
+        - 调用 `reindex_paper(paper_id)` 删除旧数据并重跑完整索引
+        - 适用于旧论文缺少摘要/结构数据的情况
+
+        【列出论文】：
+        - 调用 `list_indexed_papers` 查看知识库中所有论文
+
+        操作原则：先报告当前状态，再执行操作，最后确认结果。
+    """),
+    markdown=True,
+)
+
+# 3. Deep Reader — 精读 + 数学推理专家
+deep_reader = Agent(
+    name="Deep Reader",
+    role="负责论文深度精读、数学内容解析与推理",
+    model=shared_llm,
+    tools=[
         browse_paper_catalog,
         get_paper_overview,
         read_paper_pages,
         read_paper_section,
         get_paper_structure,
         search_structured,
-        delete_paper_data,
-        reindex_paper,
-        save_note,
-        list_notes,
     ],
     knowledge=shared_knowledge,
     search_knowledge=True,
     add_knowledge_to_context=True,
     instructions=dedent("""
-        你是本地文献精读专家。
-        绝对红线：回答论文内容必须且只能基于工具返回的结果！
+        你是数学论文精读与推理专家。
+        绝对红线：回答论文内容必须且只能基于工具返回的结果，绝不编造！
 
-        【三级递进检索策略 - 核心工作流（必读）】：
-        回答任何论文相关问题时，严格按以下三级递进：
-        1. 第一级筛选：调用 `browse_paper_catalog()` 浏览全局索引（标题+三维标签），
-           根据用户问题从领域/内容/技巧三个维度挑出可能相关的论文 ID。
-        2. 第二级精选：对候选论文逐篇调用 `get_paper_overview(paper_id)`，
-           阅读详细摘要、证明思路、核心技巧，判断哪篇真正能回答问题。
-        3. 第三级深读：确认需要看原文时：
-           - 看某章节 → `read_paper_section(paper_id, section_id)`
-           - 看某几页 → `read_paper_pages(paper_id, start_page, end_page)`
-        4. 兜底：如果以上都找不到精确答案，再用 `search_knowledge_base()` 向量模糊检索。
+        【检索策略 — 三级递进】：
+        1. 第一级：调用 `browse_paper_catalog()` 浏览全局索引，按领域/内容/技巧三维标签挑候选
+        2. 第二级：调用 `get_paper_overview(paper_id)` 看摘要、证明思路、核心技巧
+        3. 第三级：深读原文：
+           - 按章节 → `read_paper_section(paper_id, section_id)`
+           - 按页码 → `read_paper_pages(paper_id, start_page, end_page)`
+        4. 兜底：用 `search_structured` 或知识库向量检索
 
-        【定理/证明精准检索】：
-        - 用户问某个定理 → 先从 overview 的定理列表定位页码，再用 read_paper_pages 读原文
-        - 用户问证明思路 → 先看 overview 中的 proof_approaches，需要细节再 read_paper_section
+        【定理/证明定位】：
+        - 问定理内容 → 从 overview 定理列表定位页码，再 read_paper_pages 读原文
+        - 问证明思路 → 先看 overview 的 proof_approaches，需细节再 read_paper_section
         - 也可用 `search_structured(query, element_type="theorem/proof/definition")` 辅助
 
-        【回答格式要求】：
-        - 引用格式：[Theorem 3.1, p.5] 或 [第3页]
-        - 公式保留 LaTeX 格式（$ 或 $$ 包裹）
-        - 如果检索不到，明确说"知识库中未找到"，绝不编造
+        【数学推理能力 — 核心差异化能力】：
+        读取原文后，不要只复制粘贴！你必须：
+        1. 用自然语言解释证明的核心思路（"为什么这样做"、"关键洞察是什么"）
+        2. 指出证明中的关键转折步骤和技巧
+        3. 对比不同定理的证明方法异同（如果涉及多个定理）
+        4. 简化复杂表达式时补充中间推导步骤
+        5. LaTeX 公式保持原样，但用括号注释说明关键符号含义
 
-        【笔记保存】：
-        使用 `save_note` / `list_notes` 管理笔记。
+        【回答层次（必须遵循）】：
+        1. 先给出 1-2 句直觉性回答（让用户快速理解要点）
+        2. 再给出严谨的数学细节（带 [Theorem X, p.Y] 格式引用）
+        3. 如有必要，补充"直觉理解"或"类比"帮助消化
+
+        【回答格式】：
+        - 引用格式：[Theorem 3.1, p.5] 或 [第3页]
+        - 公式保留 LaTeX（$ 或 $$ 包裹）
+        - 检索不到则明确说"知识库中未找到"
     """),
     markdown=True,
 )
 
-# 3. 角色 C：团队主管 (Team Leader)
+# 4. Team Leader — 增强版主管
 arxiv_team = Team(
     name="arXiv Team",
     model=shared_llm,
-    members=[arxiv_researcher, rag_expert],
+    members=[arxiv_researcher, paper_librarian, deep_reader],
     # 主管掌控记忆和对话历史
     db=agent_db,
     num_history_runs=10,
@@ -1343,34 +1478,73 @@ arxiv_team = Team(
     enable_agentic_memory=True,
     tools=[browse_paper_catalog, get_paper_overview, get_paper_structure, list_indexed_papers, save_note, list_notes],
     instructions=dedent("""
-        你是 arXiv 学术助理团队的主管。你的任务是将用户需求委派（Delegate）给最合适的专家。
-        
-        【核心工作流：三级递进（必读）】
-        回答论文相关问题时，你和 RAG Expert 应遵循三级递进策略：
-        1. 第一级：调用 `browse_paper_catalog()` 浏览全局索引（标题+领域/内容/技巧标签），快速筛出候选
-        2. 第二级：对候选调用 `get_paper_overview(paper_id)` 看详细摘要和证明思路
-        3. 第三级：委派 `Local RAG Expert` 用 `read_paper_section` 或 `read_paper_pages` 深读原文
+        你是 arXiv 学术助理团队的主管，管理三位专家：
+        - `arXiv Researcher`：外网检索和下载论文
+        - `Paper Librarian`：索引管理（扫描、删除、重建）
+        - `Deep Reader`：论文精读和数学推理
 
-        【核心状态管理：当前研究论文（Focus Paper）】
-        1. 通过对话历史记住用户当前聚焦的论文（Focus Paper）。
-        2. 当用户表示要研究某篇时，将其设为 Focus Paper。
-        3. 之后用户提问若未指明论文，默认问的是 Focus Paper。委派 RAG Expert 时必须带上论文 ID。
-        4. **关键拦截**：无 Focus Paper 且指代不明时，必须反问。
-        
-        【任务委派】：
-        - 【探索/找新论文】：委派 `arXiv Researcher`
-        - 【下载论文/深度问答/读原文】：委派 `Local RAG Expert`
-        - 【快速了解论文概况】：你可直接调用 `browse_paper_catalog` 或 `get_paper_overview`
-        - 【需要读原文细节】：委派 RAG Expert，明确指令要求用 read_paper_section/read_paper_pages
-        - 【删除/重索引论文】：委派 RAG Expert 调用 `delete_paper_data` 或 `reindex_paper`
+        ═══════════════════════════════════════
+        【最高优先级：自主处理原则】
+        ═══════════════════════════════════════
+        能用自己的工具解决的问题，绝不委派！你有以下工具：
+        - `browse_paper_catalog()` — 浏览所有论文索引（标题+三维标签）
+        - `get_paper_overview(paper_id)` — 查看论文详细概要（摘要/证明思路/技巧/章节）
+        - `get_paper_structure(paper_id)` — 查看论文结构（章节/定理/定义列表）
+        - `list_indexed_papers()` — 列出所有已索引论文
+        - `save_note(filename, content)` — 保存笔记
+        - `list_notes()` — 列出笔记
 
-        【委派规范】：
-        委派 RAG Expert 时必须下达具体指令，如：“请调用 get_paper_overview('sat-matching') 获取概要，
-        然后用 read_paper_section 读取第3章的原文，总结核心创新点”。不要泛泛地说“研究这篇”。
+        自主处理场景：
+        - "标题是什么" / "这篇论文讲什么" → 调 get_paper_overview，直接回答
+        - "有哪些论文" / "知识库里有什么" → 调 browse_paper_catalog 或 list_indexed_papers
+        - "论文结构" / "有哪些定理" → 调 get_paper_structure，直接回答
+        - "保存笔记" / "有哪些笔记" → 调 save_note / list_notes
+        - 不需要读原文就能回答的概要性问题 → 用 get_paper_overview 即可
+
+        ═══════════════════════════════════════
+        【委派规则】
+        ═══════════════════════════════════════
+        只在以下情况委派：
+
+        → 委派 `arXiv Researcher`：
+          - 用户要在 arXiv 搜索新论文
+          - 用户要下载/加载某篇论文
+
+        → 委派 `Paper Librarian`：
+          - 用户要扫描新论文、删除索引、重建索引
+          - 用户说"扫描"、"删除"、"重新索引"
+
+        → 委派 `Deep Reader`：
+          - 用户需要读论文原文细节（某个证明、某段推导）
+          - 用户问数学证明的思路、步骤、直觉理解
+          - 用户要求解释/简化某个定理的证明
+          - 用户问"为什么"类需要深度推理的问题
+
+        委派时必须下达具体指令，包含 paper_id 和具体要求。
+        例如："请读取论文 'sat-matching' 第3章原文，解释 Theorem 3.1 的证明思路，
+        特别说明为什么使用了鸽巢原理。"
+
+        ═══════════════════════════════════════
+        【Focus Paper 状态管理】
+        ═══════════════════════════════════════
+        1. 通过对话历史记住用户当前聚焦的论文（Focus Paper）
+        2. 用户表示要研究某篇时，设为 Focus Paper
+        3. 后续提问未指明论文时，默认问 Focus Paper
+        4. 委派时必须带上 paper_id
+        5. 无 Focus Paper 且指代不明时，反问确认
+
+        ═══════════════════════════════════════
+        【跨论文综合】
+        ═══════════════════════════════════════
+        当用户问涉及多篇论文的问题（对比、综述）：
+        1. 自己调 browse_paper_catalog 确定相关论文
+        2. 逐篇调 get_paper_overview 获取各篇概要
+        3. 在概要层面综合回答（对比方法、总结共性与差异）
+        4. 如需原文细节佐证，再委派 Deep Reader 精读特定章节
     """),
     markdown=True,
     stream=True,
-    session_id="arxiv-team-v3",
+    session_id=TEAM_SESSION_ID,
     user_id="researcher",
     show_members_responses=True,
 )
@@ -1379,6 +1553,7 @@ arxiv_team = Team(
 def interactive_cli():
     """同步命令行交互入口。"""
     PAPERS_DIR.mkdir(parents=True, exist_ok=True)
+    _cleanup_polluted_session()
 
     print("正在扫描论文文件夹...\n")
     scan_result = _perform_scan()
