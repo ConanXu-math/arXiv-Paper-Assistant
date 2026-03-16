@@ -68,12 +68,17 @@ vector_db = LanceDb(
 
 
 # 把文章按语义自然分割成多个块，每个块的字符数尽量接近 1200
-semantic_chunking = SemanticChunking(chunk_size=1200, similarity_threshold=0.6)
+# embedder 必须显式指定，否则默认用 OpenAIEmbedder（需要 OPENAI_API_KEY）
+semantic_chunking = SemanticChunking(
+    embedder="minishlab/potion-base-32M",
+    chunk_size=1200,
+    similarity_threshold=0.6,
+)
 
 pdf_reader = OcrPDFReader(
     ocr_url="https://edusys5.sii.edu.cn/ocr",
-    dpi=200,
-    max_workers=4,
+    dpi=150,
+    max_workers=8,
     chunking_strategy=semantic_chunking,
     split_on_pages=True,
 )
@@ -1336,7 +1341,7 @@ arxiv_team = Team(
     num_history_runs=10,
     add_history_to_context=True,
     enable_agentic_memory=True,
-    tools=[browse_paper_catalog, get_paper_overview, list_indexed_papers, save_note, list_notes],
+    tools=[browse_paper_catalog, get_paper_overview, get_paper_structure, list_indexed_papers, save_note, list_notes],
     instructions=dedent("""
         你是 arXiv 学术助理团队的主管。你的任务是将用户需求委派（Delegate）给最合适的专家。
         
@@ -1365,7 +1370,7 @@ arxiv_team = Team(
     """),
     markdown=True,
     stream=True,
-    session_id="arxiv-team-v2",
+    session_id="arxiv-team-v3",
     user_id="researcher",
     show_members_responses=True,
 )

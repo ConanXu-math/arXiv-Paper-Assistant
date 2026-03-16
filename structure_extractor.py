@@ -13,6 +13,23 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+
+def _fix_json_escapes(s: str) -> str:
+    """Fix invalid JSON escape sequences caused by LaTeX backslashes.
+
+    LLM output often contains raw LaTeX like \\subseteq or \\mathbb inside
+    JSON strings.  These are not valid JSON escapes and cause json.loads()
+    to fail.  This function doubles any backslash that is NOT already part
+    of a legal JSON escape (\\", \\\\, \\/, \\b, \\f, \\n, \\r, \\t, \\uXXXX).
+    """
+    try:
+        json.loads(s)
+        return s
+    except json.JSONDecodeError:
+        pass
+    return re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', s)
+
+
 # ── Phase 1: Regex patterns ───────────────────────────────────────
 
 _SECTION_RE = re.compile(
@@ -204,7 +221,7 @@ def _call_llm_for_refinement(
         brace_end = raw.rfind("}")
         if brace_start != -1 and brace_end > brace_start:
             raw = raw[brace_start : brace_end + 1]
-        return json.loads(raw)
+        return json.loads(_fix_json_escapes(raw))
     except Exception as e:
         logger.warning("LLM refinement failed, using regex results: %s", e)
         return None
@@ -371,7 +388,7 @@ def extract_paper_summary(
         brace_end = raw.rfind("}")
         if brace_start != -1 and brace_end > brace_start:
             raw = raw[brace_start : brace_end + 1]
-        result = json.loads(raw)
+        result = json.loads(_fix_json_escapes(raw))
         expected_keys = {"title", "abstract", "proof_approaches", "core_techniques",
                          "field_tags", "content_tags", "technique_tags"}
         for key in expected_keys:
